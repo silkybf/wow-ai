@@ -936,7 +936,7 @@ end
 -- are meaningless markup to the agent; their tooltips are what the player sees).
 -- Every game API here is optional: whatever the client lacks is left out.
 
-local CONTEXT_MAX = 900 -- bytes of context per record; the strip has ~3.2 KB for everything
+local CONTEXT_MAX = 1950 -- bytes per context; below the bridge's 2000-character cap
 local LINK_LINES_MAX = 30 -- tooltip lines kept per link
 local LINK_BYTES_MAX = 900 -- bytes kept per link
 
@@ -994,6 +994,37 @@ function WoWAI.SkillLines()
 	return out
 end
 
+-- Forever exposes class talent trees as groups in the active trait config.
+local function PrimaryTalentTree()
+	local configID = Try(C_ClassTalents and C_ClassTalents.GetActiveConfigID)
+	local traits = C_Traits
+	if not configID or not traits then return end
+	local config = Try(traits.GetConfigInfo, configID)
+	if not config or not config.treeIDs then return end
+
+	local primary, highest = nil, 0
+	for _, treeID in ipairs(config.treeIDs) do
+		local groups = Try(traits.GetGroupDisplayInfoByTreeID, treeID)
+		if not groups then return end
+		for _, group in ipairs(groups) do
+			local totals = Try(traits.GetGroupCurrencyInfo, configID, { group.groupID })
+			if not totals then return end
+			local spent = 0
+			for _, total in ipairs(totals) do
+				for _, currency in ipairs(total.currencyInfos) do
+					spent = spent + currency.spent
+				end
+			end
+			if spent > highest then
+				primary, highest = group.displayName, spent
+			elseif spent == highest then
+				primary = nil
+			end
+		end
+	end
+	return primary
+end
+
 function WoWAI.GameContext()
 	local lines = {}
 	local version, build, _, toc = Try(GetBuildInfo)
@@ -1010,17 +1041,19 @@ function WoWAI.GameContext()
 	if name then
 		local realm = Try(GetRealmName)
 		local level = Try(UnitLevel, "player")
-		local race = Try(UnitRace, "player")
+		local race, raceToken, raceID = Try(UnitRace, "player")
 		local class = Try(UnitClass, "player")
 		local faction = Try(UnitFactionGroup, "player")
 		local guild = Try(GetGuildInfo, "player")
 		local who = "Character: " .. tostring(name) .. (realm and (" on " .. tostring(realm)) or "")
 		local desc = {}
-		if level then table.insert(desc, "level " .. tostring(level)) end
-		if race then table.insert(desc, tostring(race)) end
-		if class then table.insert(desc, tostring(class)) end
-		if #desc > 0 then who = who .. ", " .. table.concat(desc, " ") end
-		if faction then who = who .. " (" .. tostring(faction) .. ")" end
+		if level then table.insert(desc, "Level: " .. tostring(level)) end
+		if race then table.insert(desc, "Race name: " .. tostring(race)) end
+		if raceToken then table.insert(desc, "Race token: " .. tostring(raceToken)) end
+		if raceID then table.insert(desc, "Race ID: " .. tostring(raceID)) end
+		if class then table.insert(desc, "Class: " .. tostring(class)) end
+		if #desc > 0 then who = who .. ", " .. table.concat(desc, ", ") end
+		if faction then who = who .. ", Faction: " .. tostring(faction) end
 		if guild then who = who .. ", guild <" .. tostring(guild) .. ">" end
 		table.insert(lines, who)
 	end
@@ -1059,6 +1092,21 @@ function WoWAI.GameContext()
 	end
 	if #progress > 0 then table.insert(lines, table.concat(progress, "; ")) end
 
+	local primary = PrimaryTalentTree()
+	if primary then table.insert(lines, "Primary talent tree: " .. primary) end
+
+	local specAPI = C_SpecializationInfo
+	local specIndex = Try(specAPI and specAPI.GetSpecialization)
+	if type(specIndex) == "number" and specIndex > 0 then
+		local specID, specName = Try(specAPI.GetSpecializationInfo, specIndex)
+		if type(specName) == "string" and specName ~= "" then
+			table.insert(lines, "API specialization name: " .. specName)
+		end
+		if type(specID) == "number" then
+			table.insert(lines, "API specialization ID: " .. specID)
+		end
+	end
+
 	-- Classic-style talent tabs: name, icon, points spent.
 	local tabs = Try(GetNumTalentTabs)
 	if type(tabs) == "number" and tabs > 0 then
@@ -1084,9 +1132,8 @@ function WoWAI.GameContext()
 	end
 	if #parts > 0 then table.insert(lines, "Professions: " .. table.concat(parts, ", ")) end
 
-	-- Quest log ids (what is accepted, and which are done), so route planning can
-	-- skip pickups and turn-ins that no longer apply.
-	local quests = {}
+	-- Keep the full set of collected IDs separate from the bounded details.
+	local readyQuests, otherQuests, questDetails = {}, {}, {}
 	local qn = Try(C_QuestLog and C_QuestLog.GetNumQuestLogEntries) or Try(GetNumQuestLogEntries)
 	if type(qn) == "number" then
 		for i = 1, math.min(qn, 40) do
@@ -1100,11 +1147,176 @@ function WoWAI.GameContext()
 				id, header, complete = qid, isHeader, isComplete == 1 or isComplete == true
 			end
 			if not header and type(id) == "number" and id > 0 then
-				table.insert(quests, tostring(id) .. (complete and "*" or ""))
+				local ids = complete and readyQuests or otherQuests
+				table.insert(ids, tostring(id))
+				local title = Try(C_QuestLog and C_QuestLog.GetTitleForQuestID, id)
+				local objectives = Try(C_QuestLog and C_QuestLog.GetQuestObjectives, id)
+				if type(objectives) == "table" and #objectives > 0 then
+					local label = tostring(id) .. (title and (" " .. title) or "")
+					for _, objective in ipairs(objectives) do
+						local text = objective.text or objective.type or "Objective"
+						if type(objective.numFulfilled) == "number" and type(objective.numRequired) == "number" and objective.numRequired > 0 then
+							local progress = objective.numFulfilled .. "/" .. objective.numRequired
+							if not text:find(progress, 1, true) then text = text .. " " .. progress end
+						end
+						local status = objective.finished == true and "done" or (objective.finished == false and "unfinished" or "unknown")
+						table.insert(questDetails, label .. " - " .. text .. " [" .. status .. "]")
+					end
+				elseif complete and title then
+					table.insert(questDetails, id .. " " .. title .. " [ready to turn in]")
+				end
 			end
 		end
 	end
-	if #quests > 0 then table.insert(lines, "Quest log (id, * = ready to turn in): " .. table.concat(quests, ",")) end
+	if #readyQuests + #otherQuests > 0 then
+		table.insert(lines, "Quest IDs ready to turn in: " .. (#readyQuests > 0 and table.concat(readyQuests, ",") or "none"))
+		if #otherQuests > 0 then table.insert(lines, "Other quest IDs: " .. table.concat(otherQuests, ",")) end
+	end
+
+	-- Keep complete item entries within the existing context budget.
+	local gear = {}
+	for _, slot in ipairs({16, 17, 18, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19}) do
+		local link = Try(GetInventoryItemLink, "player", slot)
+		if type(link) == "string" then
+			local id, name = link:match("|Hitem:(%d+)[^|]*|h%[([^%]]+)%]|h")
+			if id then table.insert(gear, slot .. "=" .. name .. " (" .. id .. ")") end
+		end
+	end
+	local inventory, counts, order = {}, {}, {}
+	local used, capacity = 0, 0
+	local bags = C_Container
+	local complete = bags and type(bags.GetContainerItemInfo) == "function"
+	if complete then
+		for bag = 0, 4 do
+			local slots = Try(bags.GetContainerNumSlots, bag)
+			if type(slots) ~= "number" then
+				complete = false
+				break
+			end
+			capacity = capacity + slots
+			for slot = 1, slots do
+				local ok, item = pcall(bags.GetContainerItemInfo, bag, slot)
+				if not ok then
+					complete = false
+				elseif item then
+					used = used + 1
+					local id, count = item.itemID, item.stackCount
+					if type(id) == "number" and type(count) == "number" then
+						if not counts[id] then table.insert(order, id) end
+						counts[id] = (counts[id] or 0) + count
+					else
+						complete = false
+					end
+				end
+			end
+		end
+	end
+	for _, id in ipairs(order) do
+		table.insert(inventory, id .. "x" .. counts[id])
+	end
+
+	local room = 900 - #table.concat(lines, "\n") - 1
+	local bagLabel = "Bags: " .. used .. "/" .. capacity .. " used (IDxqty): "
+	local bagRoom = complete and capacity > 0 and math.min(90, math.floor(room / 2)) or 0
+	local function appendSummary(label, entries, limit)
+		if #label > limit then return 0 end
+		local summary = label
+		for index, item in ipairs(entries) do
+			local entry = (index == 1 and "" or ", ") .. item
+			local reserve = index < #entries and 5 or 0
+			if #summary + #entry + reserve > limit then
+				if #summary + 5 > limit then return 0 end
+				summary = summary .. "[...]"
+				break
+			end
+			summary = summary .. entry
+		end
+		table.insert(lines, summary)
+		return #summary + 1
+	end
+	if #gear > 0 then
+		room = room - appendSummary("Equipment (slot=name (ID)): ", gear, room - bagRoom - (bagRoom > 0 and 1 or 0))
+	end
+	if bagRoom > 0 then appendSummary(bagLabel, inventory, room) end
+
+	-- Keep the original character, gear and bag budget separate from build data.
+	room = CONTEXT_MAX - #table.concat(lines, "\n") - 1
+	local talents = {}
+	local spec, traits = C_SpecializationInfo, C_Traits
+	local group = Try(spec and spec.GetActiveSpecGroup)
+	local configID = group and Try(spec.GetCombatConfigIDForSpecGroup, group)
+	local config = configID and Try(traits and traits.GetConfigInfo, configID)
+	for _, treeID in ipairs(config and config.treeIDs or {}) do
+		for _, nodeID in ipairs(Try(traits.GetTreeNodes, treeID) or {}) do
+			local node = Try(traits.GetNodeInfo, configID, nodeID)
+			if node and node.activeEntry and (node.activeRank or 0) > 0 then
+				local entry = Try(traits.GetEntryInfo, configID, node.activeEntry.entryID)
+				local definition = entry and Try(traits.GetDefinitionInfo, entry.definitionID)
+				local name = definition and Try(C_Spell and C_Spell.GetSpellName, definition.spellID)
+				local label = name or (definition and definition.spellID) or ("node " .. nodeID)
+				table.insert(talents, label .. " " .. node.activeRank)
+			end
+		end
+	end
+	if #talents > 0 then
+		room = room - appendSummary("Active talents (rank): ", talents, math.min(350, room))
+	end
+
+	if #questDetails > 0 then
+		room = room - appendSummary("Quest details: ", questDetails, math.min(300, room))
+	end
+
+	local currencies = {}
+	local currency = C_CurrencyInfo
+	local currencyCount = Try(currency and currency.GetCurrencyListSize) or 0
+	for index = 1, currencyCount do
+		local row = Try(currency.GetCurrencyListInfo, index)
+		if row and not row.isHeader and row.name and type(row.quantity) == "number" then
+			table.insert(currencies, row.name .. " " .. row.quantity)
+		end
+	end
+	if #currencies > 0 then
+		room = room - appendSummary("Currencies: ", currencies, math.min(110, room))
+	end
+
+	local standings = {}
+	local reputation = C_Reputation
+	local factionCount = Try(reputation and reputation.GetNumFactions) or 0
+	for index = 1, factionCount do
+		local faction = Try(reputation.GetFactionDataByIndex, index)
+		if faction and faction.name and type(faction.reaction) == "number" and faction.reaction > 0 then
+			local reaction = _G["FACTION_STANDING_LABEL" .. faction.reaction] or ("reaction " .. faction.reaction)
+			local entry = faction.name .. " " .. reaction
+			local current, lower, upper = faction.currentStanding, faction.currentReactionThreshold, faction.nextReactionThreshold
+			if type(current) == "number" and type(lower) == "number" and type(upper) == "number" and upper > lower then
+				entry = entry .. " " .. (current - lower) .. "/" .. (upper - lower)
+			end
+			table.insert(standings, entry)
+		end
+	end
+	if #standings > 0 then
+		room = room - appendSummary("Reputation: ", standings, math.min(130, room))
+	end
+
+	local abilities = {}
+	local book = C_SpellBook
+	local playerBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+	if playerBank then
+		-- The first line is General on Forever. Read the class lines first.
+		local lineCount = Try(book and book.GetNumSpellBookSkillLines) or 0
+		for index = 2, lineCount do
+			local line = Try(book.GetSpellBookSkillLineInfo, index)
+			if line then
+				for slot = 1, line.numSpellBookItems do
+					local name, rank = Try(book.GetSpellBookItemName, line.itemIndexOffset + slot, playerBank)
+					if name then
+						table.insert(abilities, name .. (rank and rank ~= "" and (" " .. rank) or ""))
+					end
+				end
+			end
+		end
+	end
+	if #abilities > 0 then appendSummary("Class spellbook: ", abilities, room) end
 
 	local s = table.concat(lines, "\n"):gsub("[\30\31]", " ")
 	if #s > CONTEXT_MAX then s = s:sub(1, CONTEXT_MAX) end
@@ -1372,6 +1584,7 @@ end
 ---------------------------------------------------------------------------
 
 function WoWAI.SwitchChat(id)
+	if ui.chatMenu then ui.chatMenu:Hide() end
 	local c = FindChat(id)
 	if not c then return end
 	local prev = ActiveChat()
@@ -1467,8 +1680,14 @@ end
 -- The agent this chat talks to, by id. Empty (or
 -- "-" / "default") = the bridge's default. The bridge starts a fresh session
 -- when a chat changes agent, since a session belongs to the agent that made it.
+local DEFAULT_AGENT_CHOICES = { "claude", "codex", "grok", "agy", "hermes" }
+
 local function AgentList()
-	return run.bridgeAgents and table.concat(run.bridgeAgents, ", ") or "claude, codex, grok, agy, hermes"
+	return table.concat(run.bridgeAgents or DEFAULT_AGENT_CHOICES, ", ")
+end
+
+local function DefaultAgentLabel()
+	return run.bridgeAgent and ("Bridge default (" .. AgentName(run.bridgeAgent) .. ")") or "Bridge default"
 end
 
 function WoWAI.SetAgent(rest, c)
@@ -1488,49 +1707,9 @@ function WoWAI.SetAgent(rest, c)
 	elseif changed then
 		AddHistory(c, "system", "agent reset to the bridge's default: " .. (run.bridgeAgent and AgentName(run.bridgeAgent) or "unknown until connected"))
 	else
-		AddHistory(c, "system", "agent is the bridge's default: " .. (run.bridgeAgent and AgentName(run.bridgeAgent) or "unknown until connected") .. " (/wow-ai agent <name>, or right-click the chat and pick Agent, to change; agents: " .. AgentList() .. ")")
+		AddHistory(c, "system", "agent is the bridge's default: " .. (run.bridgeAgent and AgentName(run.bridgeAgent) or "unknown until connected") .. " (/wow-ai agent <name>, or use the agent dropdown, to change; agents: " .. AgentList() .. ")")
 	end
 	WoWAI.Render()
-end
-
-StaticPopupDialogs["WOWAI_AGENT"] = {
-	text = "Agent for this chat\n\nOne of: %s.\nEmpty = the bridge's default (%s). Changing it starts a fresh session.",
-	button1 = OKAY,
-	button2 = CANCEL,
-	hasEditBox = 1,
-	editBoxWidth = 200,
-	maxLetters = 32,
-	timeout = 0,
-	whileDead = true,
-	hideOnEscape = true,
-	OnShow = function(dialog, data)
-		local box = dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox
-		if box then
-			box:SetText(data and data.agent or "")
-			box:HighlightText()
-			box:SetFocus()
-		end
-	end,
-	OnAccept = function(dialog, data)
-		local box = dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox
-		local chat = data and FindChat(data.id)
-		if chat and box then WoWAI.SetAgent(box:GetText(), chat) end
-	end,
-	EditBoxOnEnterPressed = function(box)
-		local dialog = box:GetParent()
-		StaticPopupDialogs["WOWAI_AGENT"].OnAccept(dialog, dialog.data)
-		dialog:Hide()
-	end,
-	EditBoxOnEscapePressed = function(box)
-		box:GetParent():Hide()
-	end,
-}
-
--- Agent dialog for a chat (the active one when no id is given).
-function WoWAI.AgentPrompt(id)
-	local c = (id and FindChat(id)) or ActiveChat()
-	if not c then return end
-	StaticPopup_Show("WOWAI_AGENT", AgentList(), run.bridgeAgent and AgentName(run.bridgeAgent) or "unknown until connected", { id = c.id, agent = c.agent or "" })
 end
 
 StaticPopupDialogs["WOWAI_RENAME"] = {
@@ -1843,15 +2022,9 @@ function WoWAI.UpdateStatus()
 	else
 		cwdText = "(bridge default - start the bridge in a folder, or right-click the chat and pick Folder)"
 	end
-	local agentText
-	if c and c.agent and c.agent ~= "" then
-		agentText = AgentName(c.agent)
-	elseif run.bridgeAgent then
-		agentText = AgentName(run.bridgeAgent) .. " (bridge default)"
-	else
-		agentText = "(bridge default)"
-	end
-	ui.cwd:SetText("cwd: " .. cwdText .. "   agent: " .. agentText .. "   mode: " .. mode)
+	local agentText = c and c.agent and c.agent ~= "" and AgentName(c.agent) or DefaultAgentLabel()
+	ui.agent:SetText(agentText .. "  ▾")
+	ui.cwd:SetText("cwd: " .. cwdText .. "   mode: " .. mode)
 	if ui.resend then ui.resend:SetShown(c and c.pendingId ~= nil and mode == "pixel") end
 	if ui.refresh then ui.refresh:SetShown(mode ~= "pixel" or run.slotsExhausted or run.slotsMissing or run.pixelFailed or false) end
 	WoWAI.UpdateMini()
@@ -2441,6 +2614,7 @@ local function BuildUI()
 	local menu = CreateFrame("Frame", "WoWAIChatMenu", f, "BackdropTemplate")
 	menu:SetSize(110, 4 * 20 + 12)
 	menu:SetFrameStrata("TOOLTIP")
+	menu:SetClampedToScreen(true)
 	menu:SetBackdrop({
 		bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
 		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -2457,7 +2631,8 @@ local function BuildUI()
 	menu.title:SetWordWrap(false)
 	local function MenuItem(label, order, onClick)
 		local it = CreateFrame("Button", nil, menu)
-		it:SetSize(110 - 12, 20)
+		it:SetHeight(20)
+		it:SetPoint("TOPRIGHT", menu, "TOPRIGHT", -6, -6 - order * 20)
 		it:SetPoint("TOPLEFT", menu, "TOPLEFT", 6, -6 - order * 20)
 		local hl = it:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints()
@@ -2467,13 +2642,16 @@ local function BuildUI()
 		it.label:SetText(label)
 		it:SetScript("OnClick", function()
 			menu:Hide()
-			onClick(menu.chatId)
+			onClick(menu.chatId, menu.owner)
 		end)
 		return it
 	end
-	MenuItem("Rename...", 1, WoWAI.RenamePrompt)
-	MenuItem("Folder...", 2, WoWAI.FolderPrompt)
-	MenuItem("Agent...", 3, WoWAI.AgentPrompt)
+	local chatItems = {
+		MenuItem("Rename...", 1, WoWAI.RenamePrompt),
+		MenuItem("Folder...", 2, WoWAI.FolderPrompt),
+		MenuItem("Agent...", 3, function(id, anchor) WoWAI.ShowAgentMenu(id, anchor) end),
+	}
+	local agentItems = {}
 	-- Close once the mouse has wandered away from the menu and the row it came from.
 	menu:SetScript("OnUpdate", function(self, dt)
 		if not MouseIsOver then return end
@@ -2487,21 +2665,51 @@ local function BuildUI()
 	menu:Hide()
 	ui.chatMenu = menu
 
-	function WoWAI.ShowChatMenu(chatId, anchor)
+	local function ShowMenu(chatId, anchor, choosingAgent)
 		local c = FindChat(chatId)
 		if not c then return end
-		if menu:IsShown() and menu.chatId == chatId then
+		if menu:IsShown() and menu.chatId == chatId and menu.choosingAgent == choosingAgent then
 			menu:Hide()
 			return
 		end
 		menu.chatId = chatId
+		menu.choosingAgent = choosingAgent
 		menu.owner = anchor
 		menu.away = 0
+		for _, item in ipairs(chatItems) do item:SetShown(not choosingAgent) end
+		for _, item in ipairs(agentItems) do item:Hide() end
+		local rows = #chatItems
+		if choosingAgent then
+			local agents = run.bridgeAgents or DEFAULT_AGENT_CHOICES
+			rows = #agents + 1
+			for i = 1, rows do
+				local item = agentItems[i]
+				if not item then
+					item = MenuItem("", i, function(id)
+						local chat = FindChat(id)
+						if chat and (chat.agent or "") ~= item.agent then WoWAI.SetAgent(item.agent, chat) end
+					end)
+					agentItems[i] = item
+				end
+				item.agent = agents[i - 1] or ""
+				local label = item.agent == "" and DefaultAgentLabel() or AgentName(item.agent)
+				item.label:SetText(((c.agent or "") == item.agent and "* " or "  ") .. label)
+				item:Show()
+			end
+		end
+		menu:SetSize(choosingAgent and 180 or 110, (rows + 1) * 20 + 12)
 		menu.title:SetText(Display(c.name))
 		menu:ClearAllPoints()
-		menu:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 8, 2)
+		if anchor == ui.agent then
+			menu:SetPoint("BOTTOMLEFT", anchor, "TOPLEFT", 0, 0)
+		else
+			menu:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 8, 2)
+		end
 		menu:Show()
 	end
+
+	function WoWAI.ShowChatMenu(id, anchor) ShowMenu(id, anchor, false) end
+	function WoWAI.ShowAgentMenu(id, anchor) ShowMenu(id, anchor, true) end
 
 	ui.chatButtons = {}
 	for i = 1, MAX_CHATS do
@@ -2654,6 +2862,13 @@ local function BuildUI()
 	resend:SetPoint("LEFT", clear, "RIGHT", 6, 0)
 	resend:Hide()
 	ui.resend = resend
+
+	local agent = MakeButton(f, "", 176, function(self)
+		local c = ActiveChat()
+		if c then WoWAI.ShowAgentMenu(c.id, self) end
+	end)
+	agent:SetPoint("LEFT", clear, "RIGHT", 82, 0)
+	ui.agent = agent
 
 	-- A named, always-present button so a keybinding can click it (see /wow-ai bind).
 	local hotkey = CreateFrame("Button", "WoWAIRefreshButton", UIParent)
@@ -2819,7 +3034,7 @@ local HELP = table.concat({
 	"/wow-ai rename [name]          rename the current chat (no name = dialog; right-clicking the chat in the left panel offers it too)",
 	"/wow-ai delete                 delete the current chat",
 	"/wow-ai cd <folder>            folder this chat's agent works in (relative to the bridge's folder; no folder = back to default). Right-clicking the chat in the left panel and picking Folder does the same",
-	"/wow-ai agent [name]           which agent this chat talks to (no name = show; default = the bridge's). Right-clicking the chat and picking Agent does the same",
+	"/wow-ai agent [name]           which agent this chat talks to (no name = show; default = the bridge's). The chat window also has an agent dropdown",
 	"/wow-ai reset                  next message in this chat starts a fresh agent session",
 	"/wow-ai context [on|off]       what the agent is told about your character and where you are (no argument = show it)",
 	"/wow-ai map [...]              map layers the agent drew, the route navigator and herb/ore nodes (no argument = status and subcommands; /aimap is the same)",
