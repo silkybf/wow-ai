@@ -135,15 +135,19 @@ test('outbound records replace field separators inside user text', () => {
 
 test('the game context describes the character and rides on the hello, then only when it changes or is turned off', () => {
   const vm = newVM();
+  vm.run('function UnitRace() return "Night Elf", "NightElf", 4 end');
+  vm.run('C_SpecializationInfo = { GetSpecialization = function() return 1 end, GetSpecializationInfo = function() return 42, "Hunter" end }');
   login(vm);
   vm.run('STUB.RunTimers()');
   const hello = stripRecords(vm)[0];
   assert.deepEqual(hello.ctx.split('\n'), [
     'Game: World of Warcraft: Forever (client 1.60.1.69913, interface 16001)',
-    'Character: Testchar on Test Realm, level 23 Night Elf Hunter (Alliance), guild <Test Guild>',
+    'Character: Testchar on Test Realm, Level: 23, Race name: Night Elf, Race token: NightElf, Race ID: 4, Class: Hunter, Faction: Alliance, guild <Test Guild>',
     'Location: Duskwood - Darkshire',
     'Position: 45.2, 67.8 (map 1431)',
     'Money: 1g 23s 45c; XP: 1234/5000',
+    'API specialization name: Hunter',
+    'API specialization ID: 42',
     'Talents: Beast Mastery 10 / Marksmanship 5 / Survival 0',
     'Professions: Skinning 75/75, First Aid 40/75',
   ]);
@@ -403,7 +407,7 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
   assert.equal(vm.evaluate('WoWAI.IsConnected()'), 'true');
   const texts = () => vm.evaluate('table.concat(STUB.texts, "|")');
-  assert.ok(texts().includes('agent: Claude (bridge default)'), 'the cwd line names the bridge default');
+  assert.ok(texts().includes('Bridge default (Claude)  ▾'), 'the selector names the bridge default');
   // Without an agent of its own the chat sends no agent flag, and the reply is labelled Claude.
   vm.run('WoWAI.Send("hello")');
   const chatId = vm.evaluate('WoWAIDB.chats[1].id');
@@ -424,7 +428,7 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   rec = stripRecords(vm).find(r => r.text === 'now with codex');
   assert.equal(rec.flags, 'agent=codex');
   assert.equal(vm.evaluate('WoWAIDB.outbox.agent'), 'codex');
-  assert.ok(texts().includes('agent: Codex   mode: pixel'));
+  assert.ok(texts().includes('Codex  ▾'));
   const id2 = vm.num('WoWAIDB.chats[1].pendingId');
   nextSlot(vm, slot(`{ chat = "${chatId}", id = ${id2}, status = "done", text = "codex here", agent = "codex" }`));
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
@@ -442,16 +446,33 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   vm.run('SlashCmdList.WOWAI("agent default")');
   assert.equal(vm.evaluate('WoWAIDB.chats[1].agent'), '');
   assert.ok(vm.evaluate('WoWAIDB.chats[1].history[#WoWAIDB.chats[1].history].text').includes('agent reset to the bridge\'s default: Claude'));
-  // The Agent... menu item opens a prompt prefilled with the chat's agent.
-  vm.run('WoWAI.SetAgent("grok"); WoWAI.AgentPrompt()');
-  assert.equal(vm.evaluate('STUB.popup.which'), 'WOWAI_AGENT');
-  assert.equal(vm.evaluate('STUB.popup.data.agent'), 'grok');
+  // Open the selector for this chat and choose Codex from the bridge list.
   vm.run(`
-    local dialog = { editBox = { GetText = function() return " codex " end } }
-    StaticPopupDialogs.WOWAI_AGENT.OnAccept(dialog, STUB.popup.data)`);
+    WoWAI.SetAgent("grok")
+    for _, button in ipairs(WoWAIFrame.children) do
+      if button.text == "Grok  ▾" then button:GetScript("OnClick")(button); break end
+    end`);
+  vm.run(`
+    for _, button in ipairs(WoWAIChatMenu.children) do
+      if button.agent == "codex" and button:IsShown() then button:GetScript("OnClick")(button); break end
+    end`);
   assert.equal(vm.evaluate('WoWAIDB.chats[1].agent'), 'codex');
   // A new chat inherits the agent, like the folder.
   vm.run('WoWAI.NewChat("Second")');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].agent'), 'codex');
+  // The right-click action targets its own chat while the second chat is active.
+  vm.run(`
+    WoWAI.ShowChatMenu(WoWAIDB.chats[1].id, WoWAIFrame)
+    for _, button in ipairs(WoWAIChatMenu.children) do
+      if button.label and button.label:GetText() == "Agent..." then
+        button:GetScript("OnClick")(button)
+        break
+      end
+    end
+    for _, button in ipairs(WoWAIChatMenu.children) do
+      if button.agent == "" and button:IsShown() then button:GetScript("OnClick")(button); break end
+    end`);
+  assert.equal(vm.evaluate('WoWAIDB.chats[1].agent'), '');
   assert.equal(vm.evaluate('WoWAIDB.chats[2].agent'), 'codex');
 });
 
